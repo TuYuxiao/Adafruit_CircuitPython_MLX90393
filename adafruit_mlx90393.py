@@ -53,6 +53,8 @@ except ImportError:
     import ustruct as struct
 
 from adafruit_bus_device.i2c_device import I2CDevice
+from adafruit_bus_device.spi_device import SPIDevice
+import busio
 from micropython import const
 
 __version__ = "0.0.0-auto.0"
@@ -126,13 +128,28 @@ class MLX90393:
     Driver for the MLX90393 magnetometer.
     :param i2c_bus: The `busio.I2C` object to use. This is the only
     required parameter.
-    :param int address: (optional) The I2C address of the device.
+    :param int addr: (optional) The I2C address of the device.
     :param int gain: (optional) The gain level to apply.
     :param bool debug: (optional) Enable debug output.
     """
 
-    def __init__(self, i2c_bus, address=0x0C, gain=GAIN_1X, debug=False):
-        self.i2c_device = I2CDevice(i2c_bus, address)
+    def __init__(self, bus, addr=None, gain=GAIN_1X, debug=False):
+        if isinstance(bus, busio.I2C):
+            self._write_read = self._write_read_i2c
+            if addr is None:
+                self.device = I2CDevice(bus, 0xC0)
+            else:
+                self.device = I2CDevice(bus, addr)
+        elif isinstance(bus, busio.SPI):
+            self._write_read = self._write_read_spi
+            if addr is None:
+                import digitalio, board
+                self.device = SPIDevice(bus, digitalio.DigitalInOut(board.CE0))
+            else:
+                self.device = SPIDevice(bus, addr)
+        else:
+            assert False, "Invalid bus"
+
         self._debug = debug
         self._status_last = 0
         self._res_current = _RES_2_15
@@ -146,31 +163,15 @@ class MLX90393:
 
     def _transceive(self, payload, rxlen=0):
         """
-        Writes the specified 'payload' to the sensor
-        Returns the results of the write attempt.
-        :param bytearray payload: The byte array to write to the sensor
-        :param rxlen: (optional) The numbers of bytes to read back (default=0)
-        """
+                Writes the specified 'payload' to the sensor
+                Returns the results of the write attempt.
+                :param bytearray payload: The byte array to write to the sensor
+                :param rxlen: (optional) The numbers of bytes to read back (default=0)
+                """
         # Read the response (+1 to account for the mandatory status byte!)
         data = bytearray(rxlen + 1)
 
-        if len(payload) == 1:
-            # Transceive with repeated start
-            with self.i2c_device as i2c:
-                i2c.write_then_readinto(payload, data)
-        else:
-            # Write 'value' to the specified register
-            # TODO: Check this. It's weird that the write is accepted but the read is naked.
-            with self.i2c_device as i2c:
-                i2c.write(payload, stop=False)
-
-                while True:
-                    try:
-                        i2c.readinto(data)
-                        if data[0]:
-                            break
-                    except OSError:
-                        pass
+        self._write_read(payload, data)
 
         # Track status byte
         self._status_last = data[0]
@@ -181,6 +182,37 @@ class MLX90393:
             print("\tResponse :", [hex(b) for b in data])
             print("\t  Status :", hex(data[0]))
         return data
+
+    def _write_read_i2c(self, payload, data):
+        if len(payload) == 1:
+            # Transceive with repeated start
+            with self.device as device:
+                device.write_then_readinto(payload, data)
+        else:
+            # Write 'value' to the specified register
+            # TODO: Check this. It's weird that the write is accepted but the read is naked.
+            with self.device as device:
+                device.write(payload, stop=False)
+
+                while True:
+                    try:
+                        device.readinto(data)
+                        if data[0]:
+                            break
+                    except OSError:
+                        pass
+
+    def _write_read_spi(self, payload, data):
+        with self.device as device:
+            device.write(payload)
+
+            while True:
+                try:
+                    device.readinto(data)
+                    if data[0]:
+                        break
+                except OSError:
+                    pass
 
     @property
     def last_status(self):
@@ -240,13 +272,13 @@ class MLX90393:
         """
         # Write 'value' to the specified register
         payload = bytes([_CMD_RR, reg << 2])
-        with self.i2c_device as i2c:
-            i2c.write(payload)
+        with self.device as device:
+            device.write(payload)
 
         # Read the response (+1 to account for the mandatory status byte!)
         data = bytearray(3)
-        with self.i2c_device as i2c:
-            i2c.readinto(data)
+        with self.device as device:
+            device.readinto(data)
         # Unpack data (status byte, big-endian 16-bit register value)
         self._status_last, val = struct.unpack(">Bh", data)
         if self._debug:
